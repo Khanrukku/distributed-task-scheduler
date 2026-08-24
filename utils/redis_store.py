@@ -3,14 +3,13 @@ utils/redis_store.py
 Redis-backed task store with atomic operations and deduplication.
 
 Key design decisions:
-  - SETNX (set-if-not-exists) for task deduplication — prevents duplicate submissions
-  - Redis pipelines for atomic multi-key updates — prevents partial state writes
-  - Sorted sets for priority queuing — O(log N) insert/pop by priority score
+  - Lua scripting for atomic task creation + queue insertion
+  - Redis sorted sets for priority queuing — O(log N) insert/pop by priority score
   - TTL on completed tasks — automatic cleanup without a separate GC process
+  - Worker heartbeats stored with short-lived TTLs
 """
 
 import json
-import asyncio
 import redis.asyncio as aioredis
 from typing import Optional, List
 from datetime import datetime, timezone
@@ -26,10 +25,40 @@ LOCK_KEY = "lock:{resource}"
 TASK_TTL = 3600                     # completed tasks expire after 1 hour
 
 
+# Atomically:
+# 1. Check whether the task already exists.
+# 2. Create the task only if it does not exist.
+# 3. Apply TTL.
+# 4. Add the task to the priority queue.
+#
+# This prevents duplicate submissions from modifying queue state.
+SAVE_TASK_SCRIPT = """
+if redis.call("EXISTS", KEYS[1]) == 1 then
+    return 0
+end
+
+redis.call(
+    "SET",
+    KEYS[1],
+    ARGV[1],
+    "EX",
+    ARGV[2]
+)
+
+redis.call(
+    "ZADD",
+    KEYS[2],
+    ARGV[3],
+    ARGV[4]
+)
+
+return 1
+"""
+
+
 class RedisStore:
     """
     Central Redis store for task state and worker registry.
-    All multi-key writes use pipelines for atomicity.
     """
 
     def __init__(self, redis_url: str):
@@ -50,22 +79,30 @@ class RedisStore:
 
     async def save_task(self, task: Task) -> bool:
         """
-        Atomically save task and add to priority queue.
-        Returns False if task already exists (deduplication via SETNX).
+        Atomically save a new task and add it to the priority queue.
+
+        Returns:
+            True  -> task was newly created
+            False -> task already existed
+
+        Duplicate submissions do not refresh TTLs and do not modify
+        the priority queue.
         """
         key = TASK_KEY.format(task_id=task.id)
         serialized = json.dumps(task.to_dict())
 
-        async with self._client.pipeline(transaction=True) as pipe:
-            await pipe.setnx(key, serialized)              # deduplicate
-            await pipe.expire(key, TASK_TTL * 24)          # 24h TTL for pending
-            await pipe.zadd(
-                TASK_SET_KEY,
-                {task.id: task.priority.value},
-            )
-            results = await pipe.execute()
+        result = await self._client.eval(
+            SAVE_TASK_SCRIPT,
+            2,
+            key,
+            TASK_SET_KEY,
+            serialized,
+            TASK_TTL * 24,
+            task.priority.value,
+            task.id,
+        )
 
-        return bool(results[0])  # True if newly created
+        return bool(result)
 
     async def get_task(self, task_id: str) -> Optional[Task]:
         key = TASK_KEY.format(task_id=task_id)
@@ -77,14 +114,18 @@ class RedisStore:
         return Task.from_dict(json.loads(data))
 
     async def update_task(self, task: Task):
-        """Update task state atomically."""
+        """
+        Update task state atomically.
+
+        Terminal tasks receive a shorter TTL and are removed from
+        the priority queue.
+        """
         key = TASK_KEY.format(task_id=task.id)
         serialized = json.dumps(task.to_dict())
 
         async with self._client.pipeline(transaction=True) as pipe:
             await pipe.set(key, serialized)
 
-            # Set shorter TTL once terminal state is reached.
             if task.status in (TaskStatus.COMPLETED, TaskStatus.DEAD):
                 await pipe.expire(key, TASK_TTL)
                 await pipe.zrem(TASK_SET_KEY, task.id)
@@ -93,8 +134,10 @@ class RedisStore:
 
     async def pop_next_task(self) -> Optional[str]:
         """
-        Pop highest-priority task id from the queue.
-        Uses ZPOPMAX for atomic pop — no two workers can get the same task.
+        Pop the highest-priority task id from the queue.
+
+        ZPOPMAX is atomic, preventing multiple workers from
+        receiving the same queued task from this Redis structure.
         """
         result = await self._client.zpopmax(
             TASK_SET_KEY,
@@ -111,7 +154,9 @@ class RedisStore:
         self,
         status: Optional[TaskStatus] = None,
     ) -> List[Task]:
-        """List all tasks, optionally filtered by status."""
+        """
+        List all tasks, optionally filtered by status.
+        """
         keys = []
 
         async for key in self._client.scan_iter("task:*"):
@@ -143,8 +188,8 @@ class RedisStore:
     ) -> bool:
         """
         Try to acquire a distributed lock using SET NX EX.
-        Returns True if lock acquired, False if already held.
-        This is used for leader election and critical section protection.
+
+        Returns True if the lock is acquired, otherwise False.
         """
         key = LOCK_KEY.format(resource=resource)
 
@@ -158,6 +203,14 @@ class RedisStore:
         return result is not None
 
     async def release_lock(self, resource: str):
+        """
+        Release the distributed lock for a resource.
+
+        Note:
+        This implementation currently deletes the lock key directly.
+        A later hardening step will add ownership tokens so one client
+        cannot accidentally release another client's lock.
+        """
         key = LOCK_KEY.format(resource=resource)
         await self._client.delete(key)
 
@@ -192,6 +245,7 @@ class RedisStore:
         key = WORKER_KEY.format(worker_id=worker_id)
 
         await self._client.delete(key)
+
         await self._client.srem(
             WORKER_SET_KEY,
             worker_id,
@@ -212,7 +266,7 @@ class RedisStore:
                     WorkerInfo(**json.loads(data))
                 )
             else:
-                # Worker TTL expired — clean up set.
+                # Worker TTL expired — clean up stale registry membership.
                 await self._client.srem(
                     WORKER_SET_KEY,
                     worker_id,
