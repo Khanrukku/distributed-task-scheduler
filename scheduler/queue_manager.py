@@ -6,7 +6,7 @@ Design:
   - Durable queues survive broker restarts
   - Persistent messages survive broker restarts
   - Manual acknowledgements remove messages only after successful processing
-  - Dead-letter queue handles rejected/expired messages
+  - Dead-letter queue handles rejected/failed messages
   - RabbitMQ native priority queues support priority-based delivery
   - Configurable prefetch controls outstanding messages per consumer
   - Incoming messages are dispatched concurrently
@@ -91,21 +91,21 @@ class QueueManager:
             durable=True,
         )
 
-        # Declare main priority queue.
+        # Declare the main priority queue.
+        #
+        # Note:
+        # There is intentionally NO x-message-ttl here.
+        # Valid tasks are allowed to wait in the queue until a worker
+        # is available instead of being dead-lettered simply because
+        # they waited longer than an arbitrary time limit.
         await self._channel.declare_queue(
             self._queue_name,
             durable=True,
             arguments={
                 "x-max-priority": MAX_QUEUE_PRIORITY,
-
                 "x-dead-letter-exchange": "",
-
                 "x-dead-letter-routing-key":
                     self._dead_letter_queue,
-
-                # Messages waiting for more than 60 seconds
-                # are currently routed to the DLQ.
-                "x-message-ttl": 60000,
             },
         )
 
@@ -171,14 +171,14 @@ class QueueManager:
         """
         Process one RabbitMQ message.
 
-        The acknowledgement lifecycle stays inside this coroutine:
+        Acknowledgement lifecycle:
 
           handler succeeds
               → ACK
 
           handler raises
-              → NACK / reject with requeue=False
-              → RabbitMQ DLQ routing
+              → reject / NACK with requeue=False
+              → RabbitMQ dead-letter routing
         """
         async with message.process(
             requeue=False
@@ -199,7 +199,7 @@ class QueueManager:
                 )
 
                 # Re-raise so message.process() rejects the
-                # message instead of acknowledging it.
+                # message rather than acknowledging it.
                 raise
 
     # ── Consumption ────────────────────────────────────────────────────────────
@@ -214,12 +214,10 @@ class QueueManager:
         """
         Continuously consume messages from the main queue.
 
-        Unlike a serial consumer, this loop does not wait for one
-        message handler to finish before receiving the next message.
+        Each delivery is dispatched into its own asyncio task,
+        allowing multiple messages to be processed concurrently.
 
-        Each delivery is dispatched into its own asyncio task.
-
-        Actual execution concurrency is still bounded by:
+        Actual execution concurrency is bounded by:
           - RabbitMQ prefetch
           - the Worker's asyncio.Semaphore
         """
@@ -251,7 +249,7 @@ class QueueManager:
                     self._inflight_tasks.discard
                 )
 
-    # ── Dead-letter publishing ─────────────────────────────────────────────────
+    # ── Dead-letter publishing ────────────────────────────────────────────────
 
     async def publish_to_dead_letter(
         self,
