@@ -1,18 +1,22 @@
 """
 utils/redis_store.py
-Redis-backed task store with atomic operations and deduplication.
+Redis-backed task store with atomic operations, deduplication,
+priority queuing, distributed locking, and worker heartbeats.
 
 Key design decisions:
   - Lua scripting for atomic task creation + queue insertion
-  - Redis sorted sets for priority queuing — O(log N) insert/pop by priority score
-  - TTL on completed tasks — automatic cleanup without a separate GC process
-  - Worker heartbeats stored with short-lived TTLs
+  - Redis sorted sets for priority queuing
+  - Ownership tokens for safe distributed lock release
+  - TTL on completed tasks for automatic cleanup
+  - Worker heartbeat TTLs for stale-worker detection
 """
 
 import json
-import redis.asyncio as aioredis
-from typing import Optional, List
+import uuid
 from datetime import datetime, timezone
+from typing import List, Optional
+
+import redis.asyncio as aioredis
 
 from models.task import Task, TaskStatus, WorkerInfo
 
@@ -22,16 +26,25 @@ TASK_SET_KEY = "tasks:all"          # sorted set: score = priority
 WORKER_KEY = "worker:{worker_id}"
 WORKER_SET_KEY = "workers:active"
 LOCK_KEY = "lock:{resource}"
+
 TASK_TTL = 3600                     # completed tasks expire after 1 hour
+PENDING_TASK_TTL = TASK_TTL * 24    # pending/non-terminal tasks kept for 24h
 
 
-# Atomically:
-# 1. Check whether the task already exists.
-# 2. Create the task only if it does not exist.
-# 3. Apply TTL.
-# 4. Add the task to the priority queue.
+# ── Atomic task creation ──────────────────────────────────────────────────────
 #
-# This prevents duplicate submissions from modifying queue state.
+# The complete operation runs inside Redis as one atomic Lua script.
+#
+# If the task already exists:
+#   - its TTL is NOT refreshed
+#   - its priority is NOT modified
+#   - it is NOT inserted into the queue again
+#
+# If it is new:
+#   1. create task record
+#   2. assign TTL
+#   3. insert task into priority sorted set
+#
 SAVE_TASK_SCRIPT = """
 if redis.call("EXISTS", KEYS[1]) == 1 then
     return 0
@@ -56,9 +69,29 @@ return 1
 """
 
 
+# ── Safe distributed-lock release ─────────────────────────────────────────────
+#
+# A lock may only be deleted when its stored ownership token matches the token
+# supplied by the caller.
+#
+# This prevents a worker whose lock expired from accidentally deleting a newer
+# lock acquired by another worker.
+#
+RELEASE_LOCK_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+end
+
+return 0
+"""
+
+
 class RedisStore:
     """
     Central Redis store for task state and worker registry.
+
+    Redis atomic operations and Lua scripts are used where multiple
+    state changes must behave as one logical operation.
     """
 
     def __init__(self, redis_url: str):
@@ -79,14 +112,17 @@ class RedisStore:
 
     async def save_task(self, task: Task) -> bool:
         """
-        Atomically save a new task and add it to the priority queue.
+        Atomically create a task and insert it into the priority queue.
 
         Returns:
-            True  -> task was newly created
-            False -> task already existed
+            True:
+                Task was newly created.
 
-        Duplicate submissions do not refresh TTLs and do not modify
-        the priority queue.
+            False:
+                A task with this ID already existed.
+
+        Duplicate submissions do not alter the existing task, refresh
+        its TTL, or modify its queue priority.
         """
         key = TASK_KEY.format(task_id=task.id)
         serialized = json.dumps(task.to_dict())
@@ -97,7 +133,7 @@ class RedisStore:
             key,
             TASK_SET_KEY,
             serialized,
-            TASK_TTL * 24,
+            PENDING_TASK_TTL,
             task.priority.value,
             task.id,
         )
@@ -105,39 +141,58 @@ class RedisStore:
         return bool(result)
 
     async def get_task(self, task_id: str) -> Optional[Task]:
+        """
+        Retrieve a task from Redis by ID.
+        """
         key = TASK_KEY.format(task_id=task_id)
+
         data = await self._client.get(key)
 
         if not data:
             return None
 
-        return Task.from_dict(json.loads(data))
+        return Task.from_dict(
+            json.loads(data)
+        )
 
     async def update_task(self, task: Task):
         """
         Update task state atomically.
 
-        Terminal tasks receive a shorter TTL and are removed from
-        the priority queue.
+        Terminal tasks receive a shorter TTL and are removed from the
+        priority sorted set.
         """
         key = TASK_KEY.format(task_id=task.id)
         serialized = json.dumps(task.to_dict())
 
         async with self._client.pipeline(transaction=True) as pipe:
-            await pipe.set(key, serialized)
+            await pipe.set(
+                key,
+                serialized,
+            )
 
-            if task.status in (TaskStatus.COMPLETED, TaskStatus.DEAD):
-                await pipe.expire(key, TASK_TTL)
-                await pipe.zrem(TASK_SET_KEY, task.id)
+            if task.status in (
+                TaskStatus.COMPLETED,
+                TaskStatus.DEAD,
+            ):
+                await pipe.expire(
+                    key,
+                    TASK_TTL,
+                )
+
+                await pipe.zrem(
+                    TASK_SET_KEY,
+                    task.id,
+                )
 
             await pipe.execute()
 
     async def pop_next_task(self) -> Optional[str]:
         """
-        Pop the highest-priority task id from the queue.
+        Atomically remove and return the highest-priority task ID.
 
-        ZPOPMAX is atomic, preventing multiple workers from
-        receiving the same queued task from this Redis structure.
+        ZPOPMAX prevents two consumers using this Redis queue from
+        popping the same queue entry.
         """
         result = await self._client.zpopmax(
             TASK_SET_KEY,
@@ -148,6 +203,7 @@ class RedisStore:
             return None
 
         task_id, _score = result[0]
+
         return task_id
 
     async def list_tasks(
@@ -155,7 +211,9 @@ class RedisStore:
         status: Optional[TaskStatus] = None,
     ) -> List[Task]:
         """
-        List all tasks, optionally filtered by status.
+        Return tasks currently stored in Redis.
+
+        A TaskStatus may optionally be supplied to filter the results.
         """
         keys = []
 
@@ -167,11 +225,15 @@ class RedisStore:
         for key in keys:
             data = await self._client.get(key)
 
-            if data:
-                task = Task.from_dict(json.loads(data))
+            if not data:
+                continue
 
-                if status is None or task.status == status:
-                    tasks.append(task)
+            task = Task.from_dict(
+                json.loads(data)
+            )
+
+            if status is None or task.status == status:
+                tasks.append(task)
 
         return sorted(
             tasks,
@@ -179,49 +241,121 @@ class RedisStore:
             reverse=True,
         )
 
-    # ── Distributed lock ───────────────────────────────────────────────────────
+    # ── Distributed locking ────────────────────────────────────────────────────
 
     async def acquire_lock(
         self,
         resource: str,
         ttl: int = 10,
-    ) -> bool:
+    ) -> Optional[str]:
         """
-        Try to acquire a distributed lock using SET NX EX.
+        Attempt to acquire a distributed lock.
 
-        Returns True if the lock is acquired, otherwise False.
+        A cryptographically-random UUID token identifies the lock owner.
+
+        Redis SET NX EX guarantees that the lock is created only when
+        the resource is currently unlocked.
+
+        Args:
+            resource:
+                Logical name of the resource being protected.
+
+            ttl:
+                Lock lifetime in seconds. The TTL prevents a dead worker
+                from leaving a permanent lock behind.
+
+        Returns:
+            Ownership token when the lock is successfully acquired.
+
+            None when another worker already owns the lock.
+
+        The returned token MUST be supplied to release_lock().
         """
-        key = LOCK_KEY.format(resource=resource)
+        if ttl <= 0:
+            raise ValueError("Lock TTL must be greater than zero.")
 
-        result = await self._client.set(
+        key = LOCK_KEY.format(
+            resource=resource
+        )
+
+        token = str(uuid.uuid4())
+
+        acquired = await self._client.set(
             key,
-            "1",
+            token,
             nx=True,
             ex=ttl,
         )
 
-        return result is not None
+        if acquired is None:
+            return None
 
-    async def release_lock(self, resource: str):
-        """
-        Release the distributed lock for a resource.
+        return token
 
-        Note:
-        This implementation currently deletes the lock key directly.
-        A later hardening step will add ownership tokens so one client
-        cannot accidentally release another client's lock.
+    async def release_lock(
+        self,
+        resource: str,
+        token: str,
+    ) -> bool:
         """
-        key = LOCK_KEY.format(resource=resource)
-        await self._client.delete(key)
+        Release a distributed lock only when the caller still owns it.
+
+        A Lua compare-and-delete operation is used so the ownership
+        check and deletion occur atomically.
+
+        This prevents the following race:
+
+            Worker A acquires lock
+                    ↓
+            A's lock expires
+                    ↓
+            Worker B acquires new lock
+                    ↓
+            Worker A tries to release old lock
+                    ↓
+            B's lock must NOT be deleted
+
+        Returns:
+            True:
+                Lock existed, token matched, and lock was released.
+
+            False:
+                Lock no longer existed or belonged to another owner.
+        """
+        if not token:
+            return False
+
+        key = LOCK_KEY.format(
+            resource=resource
+        )
+
+        result = await self._client.eval(
+            RELEASE_LOCK_SCRIPT,
+            1,
+            key,
+            token,
+        )
+
+        return bool(result)
 
     # ── Worker registry ────────────────────────────────────────────────────────
 
-    async def register_worker(self, worker: WorkerInfo):
-        key = WORKER_KEY.format(worker_id=worker.worker_id)
+    async def register_worker(
+        self,
+        worker: WorkerInfo,
+    ):
+        """
+        Register a worker and create its heartbeat record.
+        """
+        key = WORKER_KEY.format(
+            worker_id=worker.worker_id
+        )
 
         await self._client.set(
             key,
-            json.dumps(worker.model_dump(mode="json")),
+            json.dumps(
+                worker.model_dump(mode="json")
+            ),
             ex=30,
         )
 
@@ -230,19 +364,39 @@ class RedisStore:
             worker.worker_id,
         )
 
-    async def update_worker(self, worker: WorkerInfo):
-        key = WORKER_KEY.format(worker_id=worker.worker_id)
+    async def update_worker(
+        self,
+        worker: WorkerInfo,
+    ):
+        """
+        Refresh worker state and heartbeat timestamp.
+        """
+        key = WORKER_KEY.format(
+            worker_id=worker.worker_id
+        )
 
-        worker.last_heartbeat = datetime.now(timezone.utc)
+        worker.last_heartbeat = datetime.now(
+            timezone.utc
+        )
 
         await self._client.set(
             key,
-            json.dumps(worker.model_dump(mode="json")),
+            json.dumps(
+                worker.model_dump(mode="json")
+            ),
             ex=30,
         )
 
-    async def deregister_worker(self, worker_id: str):
-        key = WORKER_KEY.format(worker_id=worker_id)
+    async def deregister_worker(
+        self,
+        worker_id: str,
+    ):
+        """
+        Remove a worker from the registry.
+        """
+        key = WORKER_KEY.format(
+            worker_id=worker_id
+        )
 
         await self._client.delete(key)
 
@@ -252,21 +406,34 @@ class RedisStore:
         )
 
     async def list_workers(self) -> List[WorkerInfo]:
-        worker_ids = await self._client.smembers(WORKER_SET_KEY)
+        """
+        Return currently active workers.
+
+        If a worker heartbeat key has expired, its stale ID is removed
+        from the active-worker set.
+        """
+        worker_ids = await self._client.smembers(
+            WORKER_SET_KEY
+        )
 
         workers = []
 
         for worker_id in worker_ids:
             data = await self._client.get(
-                WORKER_KEY.format(worker_id=worker_id)
+                WORKER_KEY.format(
+                    worker_id=worker_id
+                )
             )
 
             if data:
                 workers.append(
-                    WorkerInfo(**json.loads(data))
+                    WorkerInfo(
+                        **json.loads(data)
+                    )
                 )
+
             else:
-                # Worker TTL expired — clean up stale registry membership.
+                # Heartbeat TTL expired — remove stale membership.
                 await self._client.srem(
                     WORKER_SET_KEY,
                     worker_id,
