@@ -5,7 +5,7 @@ Core data models for the distributed task scheduler.
 
 import uuid
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 
