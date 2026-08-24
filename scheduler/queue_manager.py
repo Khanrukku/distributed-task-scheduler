@@ -1,6 +1,6 @@
 """
 scheduler/queue_manager.py
-RabbitMQ integration for reliable task delivery.
+RabbitMQ integration for reliable and concurrent task delivery.
 
 Design:
   - Durable queues survive broker restarts
@@ -8,11 +8,13 @@ Design:
   - Manual acknowledgements remove messages only after successful processing
   - Dead-letter queue handles rejected/expired messages
   - RabbitMQ native priority queues support priority-based delivery
-  - Prefetch count = 1 provides fair dispatch between consumers
+  - Configurable prefetch controls outstanding messages per consumer
+  - Incoming messages are dispatched concurrently
 """
 
+import asyncio
 import json
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, Set
 
 import aio_pika
 
@@ -23,9 +25,6 @@ from models.task import Task
 # LOW = 1
 # MEDIUM = 5
 # HIGH = 10
-#
-# RabbitMQ must explicitly be configured with x-max-priority
-# or the priority field on published messages will not affect delivery order.
 MAX_QUEUE_PRIORITY = 10
 
 
@@ -37,7 +36,8 @@ class QueueManager:
       - declaring durable queues
       - publishing persistent task messages
       - priority-based task delivery
-      - consuming and acknowledging tasks
+      - concurrent message dispatch
+      - acknowledgement / rejection handling
       - dead-letter routing
     """
 
@@ -46,10 +46,17 @@ class QueueManager:
         amqp_url: str,
         queue_name: str,
         dead_letter_queue: str,
+        prefetch_count: int = 1,
     ):
+        if prefetch_count <= 0:
+            raise ValueError(
+                "prefetch_count must be greater than zero"
+            )
+
         self._url = amqp_url
         self._queue_name = queue_name
         self._dead_letter_queue = dead_letter_queue
+        self._prefetch_count = prefetch_count
 
         self._connection: Optional[
             aio_pika.abc.AbstractRobustConnection
@@ -59,11 +66,14 @@ class QueueManager:
             aio_pika.abc.AbstractChannel
         ] = None
 
+        # Keeps strong references to in-flight processing tasks.
+        self._inflight_tasks: Set[asyncio.Task] = set()
+
     # ── Connection lifecycle ──────────────────────────────────────────────────
 
     async def connect(self):
         """
-        Connect to RabbitMQ and declare the required queues.
+        Connect to RabbitMQ and declare required queues.
         """
         self._connection = await aio_pika.connect_robust(
             self._url
@@ -71,10 +81,8 @@ class QueueManager:
 
         self._channel = await self._connection.channel()
 
-        # Limit the number of unacknowledged messages delivered
-        # to each consumer.
         await self._channel.set_qos(
-            prefetch_count=1
+            prefetch_count=self._prefetch_count
         )
 
         # Declare dead-letter queue first.
@@ -83,10 +91,7 @@ class QueueManager:
             durable=True,
         )
 
-        # Declare the primary task queue.
-        #
-        # x-max-priority is REQUIRED for RabbitMQ to actually
-        # honor the `priority` field attached to messages.
+        # Declare main priority queue.
         await self._channel.declare_queue(
             self._queue_name,
             durable=True,
@@ -98,19 +103,22 @@ class QueueManager:
                 "x-dead-letter-routing-key":
                     self._dead_letter_queue,
 
-                # Queue messages waiting longer than 60 seconds
-                # are automatically dead-lettered.
-                #
-                # We will review whether this TTL is desirable
-                # in a later reliability-hardening step.
+                # Messages waiting for more than 60 seconds
+                # are currently routed to the DLQ.
                 "x-message-ttl": 60000,
             },
         )
 
     async def disconnect(self):
         """
-        Close the RabbitMQ connection.
+        Wait for in-flight message handlers and close RabbitMQ.
         """
+        if self._inflight_tasks:
+            await asyncio.gather(
+                *self._inflight_tasks,
+                return_exceptions=True,
+            )
+
         if self._connection:
             await self._connection.close()
 
@@ -118,12 +126,7 @@ class QueueManager:
 
     async def publish(self, task: Task):
         """
-        Publish a task to the main RabbitMQ queue.
-
-        The message is persistent and carries the task priority.
-
-        Priority values are interpreted by RabbitMQ because
-        the queue is declared with x-max-priority.
+        Publish a persistent task message with RabbitMQ priority.
         """
         if not self._channel:
             raise RuntimeError(
@@ -132,8 +135,6 @@ class QueueManager:
 
         priority = int(task.priority.value)
 
-        # Defensive validation in case task priority definitions
-        # change in the future.
         if priority < 0 or priority > MAX_QUEUE_PRIORITY:
             raise ValueError(
                 f"Task priority must be between 0 and "
@@ -157,6 +158,50 @@ class QueueManager:
             routing_key=self._queue_name,
         )
 
+    # ── Message processing ─────────────────────────────────────────────────────
+
+    async def _process_message(
+        self,
+        message: aio_pika.abc.AbstractIncomingMessage,
+        handler: Callable[
+            [Task],
+            Awaitable[None],
+        ],
+    ):
+        """
+        Process one RabbitMQ message.
+
+        The acknowledgement lifecycle stays inside this coroutine:
+
+          handler succeeds
+              → ACK
+
+          handler raises
+              → NACK / reject with requeue=False
+              → RabbitMQ DLQ routing
+        """
+        async with message.process(
+            requeue=False
+        ):
+            try:
+                data = json.loads(
+                    message.body.decode()
+                )
+
+                task = Task.from_dict(data)
+
+                await handler(task)
+
+            except Exception as exc:
+                print(
+                    "[QueueManager] Failed to process "
+                    f"message: {exc}"
+                )
+
+                # Re-raise so message.process() rejects the
+                # message instead of acknowledging it.
+                raise
+
     # ── Consumption ────────────────────────────────────────────────────────────
 
     async def consume(
@@ -167,14 +212,16 @@ class QueueManager:
         ],
     ):
         """
-        Consume tasks from the main queue.
+        Continuously consume messages from the main queue.
 
-        Successful handler execution:
-            message is acknowledged.
+        Unlike a serial consumer, this loop does not wait for one
+        message handler to finish before receiving the next message.
 
-        Handler exception:
-            message is negatively acknowledged with requeue=False,
-            allowing RabbitMQ dead-letter routing to handle it.
+        Each delivery is dispatched into its own asyncio task.
+
+        Actual execution concurrency is still bounded by:
+          - RabbitMQ prefetch
+          - the Worker's asyncio.Semaphore
         """
         if not self._channel:
             raise RuntimeError(
@@ -188,31 +235,21 @@ class QueueManager:
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:
 
-                async with message.process(
-                    requeue=False
-                ):
-                    try:
-                        data = json.loads(
-                            message.body.decode()
-                        )
+                processing_task = asyncio.create_task(
+                    self._process_message(
+                        message,
+                        handler,
+                    )
+                )
 
-                        task = Task.from_dict(data)
+                self._inflight_tasks.add(
+                    processing_task
+                )
 
-                        await handler(task)
-
-                    except Exception as exc:
-                        # message.process(requeue=False) will reject
-                        # the message when this exception escapes.
-                        #
-                        # Because the main queue has dead-letter
-                        # configuration, RabbitMQ routes the rejected
-                        # message to the dead-letter queue.
-                        print(
-                            "[QueueManager] Failed to "
-                            f"process message: {exc}"
-                        )
-
-                        raise
+                # Remove completed tasks from the tracking set.
+                processing_task.add_done_callback(
+                    self._inflight_tasks.discard
+                )
 
     # ── Dead-letter publishing ─────────────────────────────────────────────────
 
@@ -221,8 +258,8 @@ class QueueManager:
         task: Task,
     ):
         """
-        Explicitly publish a task to the dead-letter queue after
-        application-level retry exhaustion.
+        Explicitly publish a task to the dead-letter queue
+        after application-level retry exhaustion.
         """
         if not self._channel:
             raise RuntimeError(
