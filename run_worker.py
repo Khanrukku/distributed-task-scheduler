@@ -10,8 +10,7 @@ Local concurrency capacity:
 
     num_workers × max_concurrent
 
-This value is also used as the RabbitMQ prefetch count so the broker
-can deliver enough messages to utilize the worker pool.
+RabbitMQ prefetch is configured per consumer using max_concurrent.
 """
 
 import asyncio
@@ -83,9 +82,12 @@ async def main():
             "dead_letter",
         ),
 
-        # Allow RabbitMQ to provide enough outstanding
-        # messages to utilize the local worker capacity.
-        prefetch_count=total_concurrency,
+        # Prefetch is applied per consumer.
+        # Each Worker may process up to max_concurrent
+        # tasks at the same time, so RabbitMQ should make
+        # approximately that many unacknowledged messages
+        # available to each consumer.
+        prefetch_count=max_concurrent,
     )
 
     # ── Connect infrastructure ────────────────────────────────────────────────
@@ -107,6 +109,11 @@ async def main():
         f"{num_workers} workers × "
         f"{max_concurrent} concurrent tasks "
         f"= {total_concurrency} task slots"
+    )
+
+    print(
+        "[WorkerRuntime] RabbitMQ prefetch per consumer: "
+        f"{max_concurrent}"
     )
 
     # ── Start worker runtime ──────────────────────────────────────────────────
